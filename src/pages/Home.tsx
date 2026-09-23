@@ -204,6 +204,9 @@ export default function Home() {
           <Link to="/gpu" className="arch-tab arch-tab-off border border-slate-700 hover:border-cyan-500/50">
             🧊 3D GPU 实验室 →
           </Link>
+          <Link to="/" className="text-sm text-slate-500 hover:text-cyan-300 transition-colors">
+            🏠 首页
+          </Link>
         </div>
         <p className="mt-2 text-sm text-slate-400 max-w-3xl">
           {isMoe

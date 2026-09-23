@@ -638,8 +638,11 @@ export default function GpuLab() {
           <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-white">
             GPU 3D 实验室
           </h1>
-          <Link to="/" className="text-sm text-slate-400 hover:text-cyan-300 transition-colors">
+          <Link to="/flow" className="text-sm text-slate-400 hover:text-cyan-300 transition-colors">
             ← 返回 2D 推理流程
+          </Link>
+          <Link to="/" className="text-sm text-slate-500 hover:text-cyan-300 transition-colors">
+            🏠 首页
           </Link>
         </div>
         <p className="mt-2 text-sm text-slate-400 max-w-3xl">
