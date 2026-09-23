@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import '../App.css'
@@ -459,9 +460,9 @@ export default function GpuLab() {
           <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-white">
             GPU 3D 实验室
           </h1>
-          <a href="./" className="text-sm text-slate-400 hover:text-cyan-300 transition-colors">
+          <Link to="/" className="text-sm text-slate-400 hover:text-cyan-300 transition-colors">
             ← 返回 2D 推理流程
-          </a>
+          </Link>
         </div>
         <p className="mt-2 text-sm text-slate-400 max-w-3xl">
           用 3D 看推理时 GPU 里发生了什么：Prefill 的算力高峰、Decode 的带宽瓶颈、多卡互联的 NVLink 高速路与 PCIe 羊肠小道。拖动旋转，滚轮缩放。
