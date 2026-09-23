@@ -8,9 +8,10 @@ import '../App.css'
 /* 模式定义                                                            */
 /* ------------------------------------------------------------------ */
 
-type Mode = 'prefill' | 'decode' | 'nvlink' | 'pcie' | 'tp' | 'pp' | 'ep'
+type Mode = 'vllm' | 'prefill' | 'decode' | 'nvlink' | 'pcie' | 'tp' | 'pp' | 'ep'
 
 const MODES: { id: Mode; label: string; icon: string }[] = [
+  { id: 'vllm', label: 'vLLM 引擎全景', icon: '🧠' },
   { id: 'prefill', label: 'Prefill 的 GPU', icon: '⚡' },
   { id: 'decode', label: 'Decode 的 GPU', icon: '🐢' },
   { id: 'nvlink', label: 'NVLink 多卡互联', icon: '🔗' },
@@ -28,6 +29,11 @@ const MB_COLORS = [0x22d3ee, 0x34d399, 0xfbbf24, 0xf472b6]
 const STAGE_X = [-7.5, -2.5, 2.5, 7.5]
 
 const HUD: Record<Mode, { title: string; chips: string[]; desc: string }> = {
+  vllm: {
+    title: 'vLLM 全景：一次请求的一生',
+    chips: ['Continuous Batching：prefill / decode 混在同一个 batch', 'PagedAttention：KV 按 Block（16 token）分页，像 OS 内存', 'Chunked Prefill：长 prompt 切块，不饿死 decode', 'KV 不够时：抢占 / LRU 驱逐，请求回队列'],
+    desc: '从左到右跟一遍：请求经 API Server 分词后进入等待队列；Scheduler 做连续批处理——每个调度周期把新请求插入 batch 的空槽（prefill，一次算一串 token），已在跑的序列每步只算 1 个 token（decode），两者共享同一块 GPU。GPU 每算一步都把新 KV 写进 Block 池（PagedAttention，按 16 token 一块分页分配，满了就驱逐最久没用的块）；采样器选出下一个 token 后经弧线送回输入——这就是自回归循环；遇到 EOS 的序列离开 batch、释放块、流式吐回客户端。拖动旋转，可以从上空俯瞰整条流水线。',
+  },
   prefill: {
     title: 'Prefill 阶段：算力密集（Compute-bound）',
     chips: ['SM 利用率 ≈ 100%', '显存带宽：中等', '全部 prompt token 并行涌入', 'KV Cache：高速写入'],
@@ -177,6 +183,52 @@ function makeGrid(scene: THREE.Scene) {
   ;(grid.material as THREE.Material).transparent = true
   ;(grid.material as THREE.Material).opacity = 0.5
   scene.add(grid)
+}
+
+/** 3D 文字标签（Canvas 贴图 Sprite） */
+function makeLabel(text: string, color = '#a5f3fc', scale = 1) {
+  const font = 'bold 44px "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif'
+  const c = document.createElement('canvas')
+  const ctx0 = c.getContext('2d')!
+  ctx0.font = font
+  c.width = Math.ceil(ctx0.measureText(text).width) + 40
+  c.height = 72
+  const ctx = c.getContext('2d')!
+  ctx.font = font
+  ctx.fillStyle = color
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(text, c.width / 2, 36)
+  const tex = new THREE.CanvasTexture(c)
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }))
+  const h = 1.0 * scale
+  sp.scale.set((c.width / 72) * h, h, 1)
+  return sp
+}
+
+/** 引擎组件节点盒：发光底座 + 文字标签，返回中心坐标 */
+function makeNode(
+  scene: THREE.Scene, x: number, z: number, w: number, d: number,
+  label: string, accent: number, opts: { labelColor?: string; h?: number; y?: number } = {}
+) {
+  const y = opts.y ?? 0
+  const h = opts.h ?? 1.2
+  const box = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshStandardMaterial({ color: 0x101c30, emissive: accent, emissiveIntensity: 0.14 })
+  )
+  box.position.set(x, y + h / 2, z)
+  scene.add(box)
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(box.geometry),
+    new THREE.LineBasicMaterial({ color: accent, transparent: true, opacity: 0.65 })
+  )
+  edges.position.copy(box.position)
+  scene.add(edges)
+  const sp = makeLabel(label, opts.labelColor ?? '#a5f3fc', 0.85)
+  sp.position.set(x, y + h + 0.8, z)
+  scene.add(sp)
+  return new THREE.Vector3(x, y + h, z)
 }
 
 function addLights(scene: THREE.Scene) {
@@ -605,7 +657,182 @@ function buildEP(scene: THREE.Scene, updaters: Updater[]) {
   })
 }
 
+/* ---------- vLLM 引擎全景 ---------- */
+
+function buildVllm(scene: THREE.Scene, updaters: Updater[]) {
+  makeGrid(scene)
+  const CYAN = 0x22d3ee, GREEN = 0x34d399, PINK = 0xf472b6, GOLD = 0xffe9a8
+
+  // ① 客户端 → ② API Server / Tokenizer → ③ 等待队列 → ④ Scheduler
+  makeNode(scene, -19, 0, 2, 1.6, 'Client', 0x94a3b8)
+  makeNode(scene, -15.5, 0, 3, 2, 'API Server · Tokenizer', CYAN)
+  makeNode(scene, -8.5, 0, 3, 2, 'Scheduler · 连续批处理', CYAN)
+
+  const qLabel = makeLabel('Waiting Queue', '#94a3b8', 0.7)
+  qLabel.position.set(-12, 2.6, 0)
+  scene.add(qLabel)
+
+  // 请求流：Client → API Server（3 个颜色 = 3 个在途请求）
+  MB_COLORS.forEach((c, i) => {
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-17.9, 1.1, -0.5 + i * 0.5), new THREE.Vector3(-16, 1.1, -0.3 + i * 0.3)],
+      c, 0.35 + i * 0.04, 1, 0.14)
+    // 分词后的 token ids → 等待队列
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-13.9, 1.0, -0.3 + i * 0.3), new THREE.Vector3(-12.6, 1.0, -0.4 + i * 0.4)],
+      0xffffff, 0.3 + i * 0.03, 2, 0.09)
+    // 队列 → Scheduler
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-11.4, 1.0, -0.4 + i * 0.4), new THREE.Vector3(-10.1, 1.0, 0)],
+      c, 0.16, 1, 0.13)
+  })
+
+  // ④ Scheduler 头顶的 batch 槽位架：6 槽循环演示 空→prefill(闪)→decode(稳)→完成
+  const slotMats: THREE.MeshStandardMaterial[] = []
+  for (let i = 0; i < 6; i++) {
+    const x = -9.9 + i * 0.56
+    const frame = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(0.48, 0.6, 0.6)),
+      new THREE.LineBasicMaterial({ color: 0x3a4a63 })
+    )
+    frame.position.set(x, 2.5, 0)
+    scene.add(frame)
+    const m = new THREE.MeshStandardMaterial({ color: 0x131f33, emissive: CYAN, emissiveIntensity: 0.03 })
+    const cell = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.5, 0.5), m)
+    cell.position.set(x, 2.5, 0)
+    scene.add(cell)
+    slotMats.push(m)
+  }
+  const slotLabel = makeLabel('batch 槽位：闪 = 新请求 prefill 插入', '#67e8f9', 0.55)
+  slotLabel.position.set(-8.5, 3.6, 0)
+  scene.add(slotLabel)
+
+  // ⑤ GPU 大板 + SM 阵列
+  const gpu = makeBoard()
+  gpu.group.position.set(0, 0.25, 0)
+  gpu.group.scale.setScalar(1.4)
+  scene.add(gpu.group)
+  const smMats = makeSMGrid(gpu.group, 10)
+  const gpuLabel = makeLabel('GPU：Prefill / Decode 混跑', '#a5f3fc', 0.9)
+  gpuLabel.position.set(0, 3.6, 0)
+  scene.add(gpuLabel)
+
+  // Prefill 车道（上，z=-3）：一次一串 token；Decode 车道（下，z=+3）：每步 1 token
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(-7, 1.0, -3), new THREE.Vector3(-3.4, 0.9, -1.8)],
+    CYAN, 0.85, 4, 0.13)
+  MB_COLORS.forEach((c, i) => {
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-7, 1.0, 3), new THREE.Vector3(-3.4, 0.9, 1.8)],
+      c, 0.3, 1, 0.12, i * 0.33)
+  })
+  const pfLabel = makeLabel('Prefill：一次一串 token', '#67e8f9', 0.55)
+  pfLabel.position.set(-5.2, 2.3, -3)
+  scene.add(pfLabel)
+  const dcLabel = makeLabel('Decode：每步 1 token', '#fcd34d', 0.55)
+  dcLabel.position.set(-5.2, 2.3, 3)
+  scene.add(dcLabel)
+
+  // ⑥ KV Block 池（PagedAttention：分页分配 / LRU 驱逐）
+  const kvLabel = makeLabel('KV Cache · Block 池（16 token/块）', '#6ee7b7', 0.75)
+  kvLabel.position.set(7, 2.9, -3)
+  scene.add(kvLabel)
+  const kvMats: THREE.MeshStandardMaterial[] = []
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 4; c++) {
+      const m = new THREE.MeshStandardMaterial({ color: 0x101c2a, emissive: GREEN, emissiveIntensity: 0.03 })
+      const blk = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), m)
+      blk.position.set(6.1 + c * 0.72, 0.6 + r * 0.72, -3)
+      scene.add(blk)
+      kvMats.push(m)
+    }
+  }
+  // KV 写入（GPU → 池）与读取（池 → GPU，decode 每步全量读）
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(3.4, 0.9, -1.6), new THREE.Vector3(5.6, 1.0, -2.6)],
+    GREEN, 0.6, 3, 0.1)
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(5.6, 0.7, -3.3), new THREE.Vector3(3.4, 0.7, -2.0)],
+    0x6ee7b7, 0.4, 2, 0.09)
+
+  // ⑦ 采样器
+  makeNode(scene, 7, 3, 2.2, 1.8, '采样 Sampling', PINK, { labelColor: '#f9a8d4' })
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(3.4, 0.9, 1.8), new THREE.Vector3(5.7, 1.1, 2.9)],
+    PINK, 0.4, 3, 0.1)
+  const pick = new THREE.Mesh(
+    new THREE.SphereGeometry(0.24, 12, 12),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: PINK, emissiveIntensity: 1.4 })
+  )
+  pick.position.set(7, 1.65, 3)
+  scene.add(pick)
+  updaters.push((_dt, t) => {
+    pick.material.emissiveIntensity = 0.8 + Math.max(0, Math.sin(t * 4)) * 1.2
+  })
+
+  // ⑧ 自回归回路：选中的 token 弧线送回 GPU 输入
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(7, 1.7, 3), new THREE.Vector3(3, 6.8, 3.6), new THREE.Vector3(0, 1.3, 0.9)],
+    0xf9a8d4, 0.3, 2, 0.13)
+  const loopLabel = makeLabel('自回归：新 token 拼回输入', '#f9a8d4', 0.6)
+  loopLabel.position.set(3.4, 7.6, 3.6)
+  scene.add(loopLabel)
+
+  // ⑨ EOS：序列离开 batch → Detokenizer → 流式返回客户端
+  makeNode(scene, 12, 0, 2.8, 1.8, 'Detokenizer · 流式输出', GOLD, { labelColor: '#fde68a' })
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(8.2, 1.0, 2.8), new THREE.Vector3(10.4, 1.0, 0.6)],
+    GOLD, 0.4, 2, 0.12)
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(13.5, 1.0, 0), new THREE.Vector3(17, 2.6, -2.2), new THREE.Vector3(19.5, 2.8, -3.4)],
+    0xfde68a, 0.45, 3, 0.12)
+  // 序列结束 → 释放 KV 块（灰脉冲回池）
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(12, 0.8, -0.9), new THREE.Vector3(8.8, 0.8, -2.4)],
+    0x94a3b8, 0.25, 1, 0.1)
+
+  // ---- 动画驱动 ----
+  // batch 槽位：空(暗) → prefill(爆闪) → decode(稳亮) → 完成(熄灭)
+  updaters.push((_dt, t) => {
+    slotMats.forEach((m, i) => {
+      const s = (t + i * 1.7) % 11
+      m.emissive.setHex(MB_COLORS[i % 4])
+      if (s < 0.5) m.emissiveIntensity = 0.03
+      else if (s < 2.2) m.emissiveIntensity = 0.7 + Math.random() * 0.8
+      else if (s < 9) m.emissiveIntensity = 0.32
+      else if (s < 10) m.emissiveIntensity = 0.06
+      else m.emissiveIntensity = 0.03
+    })
+  })
+  // KV 块：绿色渐进填充 → 红闪（LRU 驱逐）→ 释放变暗
+  updaters.push((_dt, t) => {
+    kvMats.forEach((m, i) => {
+      const b = (t * 0.7 + i * 0.9) % 9
+      if (b < 6.5) {
+        m.emissive.setHex(GREEN)
+        m.emissiveIntensity = 0.06 + b * 0.11
+      } else if (b < 7.5) {
+        m.emissive.setHex(0xef4444)
+        m.emissiveIntensity = 0.4 + Math.random() * 0.8
+      } else {
+        m.emissive.setHex(GREEN)
+        m.emissiveIntensity = 0.03
+      }
+    })
+  })
+  // SM 阵列：周期性 prefill 算力爆发 + decode 步进式稀疏点亮
+  updaters.push((_dt, t) => {
+    const burst = t % 6 < 0.7
+    const row = Math.floor(t * 3) % 10
+    smMats.forEach((m, i) => {
+      if (burst) m.emissiveIntensity = 0.9 + Math.random() * 0.7
+      else m.emissiveIntensity = Math.floor(i / 10) === row ? 1.3 : 0.08
+    })
+  })
+}
+
 const BUILDERS: Record<Mode, (scene: THREE.Scene, updaters: Updater[]) => void> = {
+  vllm: buildVllm,
   prefill: buildPrefill,
   decode: buildDecode,
   nvlink: buildNvlink,
@@ -616,6 +843,7 @@ const BUILDERS: Record<Mode, (scene: THREE.Scene, updaters: Updater[]) => void> 
 }
 
 const CAM_POS: Record<Mode, [number, number, number]> = {
+  vllm: [13, 12, 24],
   prefill: [11, 9, 13],
   decode: [11, 9, 13],
   nvlink: [0, 17, 22],
@@ -648,7 +876,8 @@ function GpuScene({ mode }: { mode: Mode }) {
 
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
-    controls.target.set(0, 0.5, 0)
+    const target: [number, number, number] = mode === 'vllm' ? [0, 1.5, 0] : [0, 0.5, 0]
+    controls.target.set(...target)
     controls.maxPolarAngle = Math.PI * 0.49
 
     addLights(scene)
@@ -685,6 +914,10 @@ function GpuScene({ mode }: { mode: Mode }) {
           const m = obj.material as THREE.Material | THREE.Material[]
           if (Array.isArray(m)) m.forEach((x) => x.dispose())
           else m.dispose()
+        } else if (obj instanceof THREE.Sprite) {
+          const m = obj.material as THREE.SpriteMaterial
+          m.map?.dispose()
+          m.dispose()
         }
       })
       renderer.dispose()
@@ -702,7 +935,7 @@ function GpuScene({ mode }: { mode: Mode }) {
 export default function GpuLab() {
   const [mode, setMode] = useState<Mode>(() => {
     const h = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : ''
-    return ([...MODES, ...PARALLEL_MODES].some((m) => m.id === h) ? h : 'prefill') as Mode
+    return ([...MODES, ...PARALLEL_MODES].some((m) => m.id === h) ? h : 'vllm') as Mode
   })
   const hud = HUD[mode]
   const isParallel = (PARALLEL_MODES as { id: Mode }[]).some((m) => m.id === mode)
@@ -758,7 +991,9 @@ export default function GpuLab() {
         <div className="relative rounded-xl border border-slate-800 bg-[#0a1120] overflow-hidden" style={{ height: 560 }}>
           <GpuScene mode={mode} />
           {/* HUD 覆盖层 */}
-          <div className="absolute top-4 left-4 right-4 pointer-events-none flex flex-wrap items-start gap-3">
+          <div className={`pointer-events-none flex gap-3 ${mode === 'vllm'
+            ? 'absolute bottom-8 left-4 items-end'
+            : 'absolute top-4 left-4 right-4 items-start flex-wrap'}`}>
             <div className="rounded-lg bg-slate-900/85 border border-slate-700 px-4 py-3 max-w-md backdrop-blur">
               <h2 className="text-sm font-bold text-white">{hud.title}</h2>
               <p className="mt-1.5 text-xs text-slate-300 leading-relaxed">{hud.desc}</p>
@@ -779,7 +1014,7 @@ export default function GpuLab() {
 
       {/* 图例 / 说明 */}
       <div className="max-w-[1360px] mx-auto px-5 mt-6 pb-14 grid md:grid-cols-2 gap-4">
-        {!isParallel && (<>
+        {!isParallel && mode !== 'vllm' && (<>
         <div className="info-card">
           <h3 className="info-title">🗺️ 场景图例</h3>
           <p>
@@ -807,6 +1042,20 @@ export default function GpuLab() {
           <h3 className="info-title">🛠️ 工程上怎么补 PCIe 的短板？</h3>
           <p>
             ① 减少跨卡通信：数据并行代替张量并行；② 通信与计算重叠（overlap）；③ DeepSeek 的跨节点 DMA / 专家并行把通信摊到训练全程；④ 消费级组集群时优先同机 NVLink 域内做张量并行，跨机走 RDMA 网络。
+          </p>
+        </div>
+        </>)}
+        {mode === 'vllm' && (<>
+        <div className="info-card">
+          <h3 className="info-title">🗺️ vLLM 全景图例</h3>
+          <p>
+            从左到右：<b>Client → API Server/Tokenizer → 等待队列 → Scheduler</b>（头顶 6 个 batch 槽位：爆闪 = 新请求 prefill 插入，稳亮 = decode 常驻）→ <b>GPU</b>（SM 阵列周期性全亮 = prefill 算力爆发，逐行点亮 = decode 步进）→ <b>KV Block 池</b>（绿 = 占用渐增，红闪 = LRU 驱逐，暗 = 已释放）→ <b>采样器</b>（粉）→ 亮金 token 经 <b>Detokenizer</b> 流式返回；粉色弧线是<b>自回归回路</b>，灰脉冲是 EOS 后释放 KV 块。
+          </p>
+        </div>
+        <div className="info-card">
+          <h3 className="info-title">📖 一次请求的一生（vLLM 调度循环）</h3>
+          <p>
+            ① 请求分词进队列；② 每个调度周期，Scheduler 给新请求分配物理块、塞进 batch 空槽跑 <b>prefill</b>（长 prompt 会被 chunked 切块）；③ 已在跑的序列每步 <b>decode 1 个 token</b>，新 KV 追加进 Block 池；④ 采样出的 token 拼回输入，直到 EOS；⑤ 序列出 batch、释放块、流式吐回。KV 不够时抢占（preempt）最老的序列回队列——画面里就是槽位熄灭、灰脉冲回池。
           </p>
         </div>
         </>)}
