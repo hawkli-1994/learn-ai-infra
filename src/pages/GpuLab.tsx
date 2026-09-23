@@ -60,8 +60,8 @@ const HUD: Record<Mode, { title: string; chips: string[]; desc: string }> = {
   },
   ep: {
     title: '专家并行 EP：把专家搬到不同卡（GShard / DeepSeek）',
-    chips: ['切分：MoE 的 Expert 分散放置', 'Router 决定 token 去向', '通信：all-to-all dispatch / combine', '代表：GShard、Mixtral、DeepSeek-V3'],
-    desc: '每个 GPU 只放 2 个专家；token 经过门控网络后，被「快递」到目标专家所在的卡（dispatch），算完再汇回（combine）——这就是 all-to-all。专家越多扩展性越好；通信密集但可用更便宜的互联（甚至跨节点），所以 DeepSeek 用 EP 替换大部分 TP。',
+    chips: ['切分：MoE 的 Expert 分散放置', 'Router 在每个 GPU 本地运行', 'dispatch：token → 目标专家所在卡', 'combine：结果 → 回 token 来源卡（all-to-all 对称）'],
+    desc: '每个 GPU 只放 2 个专家；注意并没有中央 Router——每张卡用本地门控网络给自己的 token 选专家，然后 all-to-all：token 被发往目标专家所在的卡（dispatch），专家算完后结果再回到 token 的来源卡，继续走下一层（combine）。画面中每块卡既发出也接收彩色 token，流量是对称的。专家越多扩展性越好，所以 DeepSeek 用 EP 替换大部分 TP。',
   },
 }
 
@@ -473,54 +473,71 @@ function buildEP(scene: THREE.Scene, updaters: Updater[]) {
   makeGrid(scene)
   const boards = makeStageRow(scene, 0xf59e0b)
 
-  // 每卡 2 个专家，颜色各异
-  const expertPos: THREE.Vector3[] = []
+  // 每卡：后排 2 个本地专家（颜色各异）+ 前排「本地 token 队列」发光板
+  const expertPos: THREE.Vector3[][] = []
+  const homePos: THREE.Vector3[] = []
   STAGE_X.forEach((x, gi) => {
+    const experts: THREE.Vector3[] = []
     for (let e = 0; e < 2; e++) {
       const idx = gi * 2 + e
       const color = EXPERT_COLORS[idx]
       const chip = new THREE.Mesh(
-        new THREE.BoxGeometry(1.5, 0.6, 1.5),
+        new THREE.BoxGeometry(1.4, 0.6, 1.2),
         new THREE.MeshStandardMaterial({ color: 0x1c2436, emissive: color, emissiveIntensity: 0.55 })
       )
-      const pos = new THREE.Vector3(x - 0.9 + e * 1.8, 1.3, 0)
+      const pos = new THREE.Vector3(x - 0.9 + e * 1.8, 1.3, -1.2)
       chip.position.copy(pos)
       scene.add(chip)
-      expertPos.push(pos.clone().setY(1.3))
-      // 让所属 GPU 的 die 也带上专家色微光
-      boards[gi].dieMat.emissive = new THREE.Color(color)
-      boards[gi].dieMat.emissiveIntensity = 0.12
+      experts.push(pos.clone().setY(1.4))
     }
+    expertPos.push(experts)
+
+    const home = new THREE.Vector3(x, 0.7, 2.6)
+    const plate = new THREE.Mesh(
+      new THREE.BoxGeometry(2.4, 0.16, 1.3),
+      new THREE.MeshStandardMaterial({ color: 0x241d10, emissive: 0xfbbf24, emissiveIntensity: 0.35 })
+    )
+    plate.position.copy(home)
+    scene.add(plate)
+    homePos.push(home.clone().setY(0.95))
+    boards[gi].dieMat.emissiveIntensity = 0.1
   })
 
-  // Router：左侧门控节点
-  const router = new THREE.Mesh(
-    new THREE.BoxGeometry(1.6, 1.6, 1.6),
-    new THREE.MeshStandardMaterial({ color: 0x2c2314, emissive: 0xfbbf24, emissiveIntensity: 0.7 })
-  )
-  router.position.set(-13, 1.4, 0)
-  scene.add(router)
-  const output = new THREE.Mesh(
-    new THREE.BoxGeometry(1.4, 1.4, 1.4),
-    new THREE.MeshStandardMaterial({ color: 0x14301f, emissive: 0x34d399, emissiveIntensity: 0.6 })
-  )
-  output.position.set(13, 1.4, 0)
-  scene.add(output)
+  // all-to-all fabric：所有卡两两之间的淡线（对称点对点）
+  for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      const line = new THREE.Mesh(
+        new THREE.TubeGeometry(
+          new THREE.CatmullRomCurve3([homePos[i], homePos[j]]), 8, 0.02, 6, false
+        ),
+        new THREE.MeshBasicMaterial({ color: 0x3a4a63, transparent: true, opacity: 0.5 })
+      )
+      scene.add(line)
+    }
+  }
 
-  // all-to-all dispatch：每个专家一条彩色线，token 定向快递
-  expertPos.forEach((pos, idx) => {
-    const color = EXPERT_COLORS[idx]
-    makeFlowGroup(scene, updaters,
-      [new THREE.Vector3(-12, 1.4, 0), pos.clone().setY(1.3)],
-      color, 0.32, 2, 0.11)
-    // combine：专家结果汇回输出节点
-    makeFlowGroup(scene, updaters,
-      [pos.clone().setY(1.3), new THREE.Vector3(12, 1.4, 0)],
-      color, 0.32, 2, 0.11)
-  })
+  // dispatch + combine：每卡 token 经本地 Router 决策，沿弧线发往目标专家，再返回来源卡
+  // 每卡画 3 条出向流（自卡专家 + 左右两邻卡专家），往返共用弧线、相位错开
+  for (let i = 0; i < 4; i++) {
+    const targets = [i, (i + 1) % 4, (i + 3) % 4]
+    targets.forEach((j, k) => {
+      const e = k % 2
+      const color = EXPERT_COLORS[j * 2 + e]
+      const from = homePos[i]
+      const to = expertPos[j][e].clone().setY(1.5)
+      const mid = from.clone().lerp(to, 0.5).setY(4.4 + Math.abs(i - j) * 0.7)
+      makeFlowGroup(scene, updaters, [from, mid, to], color, 0.3, 2, 0.11)
+      // combine：结果沿同弧线回到 token 来源卡（错半相，形成往返）
+      makeFlowGroup(scene, updaters, [to, mid, from], color, 0.3, 2, 0.11, 0.5)
+    })
+  }
 
+  // 本地 Router 脉冲（每卡 die 代表本地门控决策）
   updaters.push((_dt, t) => {
-    ;(router.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.5 + Math.sin(t * 3) * 0.3
+    boards.forEach((b, i) => {
+      b.dieMat.emissive = new THREE.Color(0xfbbf24)
+      b.dieMat.emissiveIntensity = 0.08 + Math.max(0, Math.sin(t * 2.5 + i)) * 0.2
+    })
   })
 }
 
@@ -733,7 +750,7 @@ export default function GpuLab() {
         <div className="info-card">
           <h3 className="info-title">🗺️ 并行场景图例</h3>
           <p>
-            一排 4 块 <b>GPU 板卡</b>（stage）；✂️ TP：卡上方是同一层的 <b>1/4 权重切片</b>，切片间双向粒子 = all-reduce；🏭 PP：卡上方是<b>不同的层 slab</b>，4 色微批次错位推进；📦 EP：卡上方是 8 个<b>彩色专家</b>，彩色 token 经 Router 定向快递（all-to-all）。
+            一排 4 块 <b>GPU 板卡</b>（stage）；✂️ TP：卡上方是同一层的 <b>1/4 权重切片</b>，切片间双向粒子 = all-reduce；🏭 PP：卡上方是<b>不同的层 slab</b>，4 色微批次错位推进；📦 EP：每卡后排 2 个<b>彩色专家</b>、前排琥珀板是<b>本地 token 队列</b>；彩色 token 沿弧线发往目标专家再返回来源卡——无中央 Router，all-to-all 对称往返。
           </p>
         </div>
         <div className="info-card">
