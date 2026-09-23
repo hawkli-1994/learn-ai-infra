@@ -50,8 +50,8 @@ const HUD: Record<Mode, { title: string; chips: string[]; desc: string }> = {
   },
   tp: {
     title: '张量并行 TP：把一层切开（Megatron-LM）',
-    chips: ['切分：层内权重（列/行切）', '每 token 广播 → 各算一片 → all-reduce 合并', '通信量：大 · 延迟敏感', '适用范围：单机 NVLink 域内（通常 ≤8 卡）'],
-    desc: '同一个层的权重矩阵被切成 4 片放在 4 张卡上；每个 token 先广播到全部 GPU，各自计算部分结果，再沿 NVLink 环做 all-reduce 合并。每层两次集合通信，带宽需求极高——TP 几乎是 NVLink 存在的理由。',
+    chips: ['切分：同一层 W 切成 4 片（切缝可见）', '同一份 token 广播给 4 卡', '各卡算出自己的 1/4 部分和', '头顶光环 = NVLink all-reduce 环'],
+    desc: '上方的半透明矩阵是切分前的完整一层 W，彩色实块是被竖切走的 4 片、各放一张卡。左侧的 token 被广播到每张卡，与本地切片相乘得到 1/4 部分和；4 份部分和沿头顶光环（all-reduce 环）逐卡合并，最终环上只剩一份完整结果，以亮金色 token 输出。通信发生在每一层、每个 token 上，带宽需求极高——TP 几乎是 NVLink 存在的理由，也只活在单机 NVLink 域（通常 ≤8 卡）。',
   },
   pp: {
     title: '流水线并行 PP：把模型分层（GPipe / 1F1B）',
@@ -394,42 +394,106 @@ function makeStageRow(scene: THREE.Scene, accent = 0x22d3ee) {
 
 function buildTP(scene: THREE.Scene, updaters: Updater[]) {
   makeGrid(scene)
-  makeStageRow(scene)
+  const boards = makeStageRow(scene)
+  const RING_Y = 6.4
+  const RING_RX = 11.2
+  const RING_RY = 1.7
 
-  // 每卡上方的「权重切片」（1/4 矩阵），切开的缝清晰可见
-  STAGE_X.forEach((x) => {
-    const shard = new THREE.Mesh(
-      new THREE.BoxGeometry(1.5, 1.3, 1.5),
+  // 半透明「完整一层 W」ghost 矩阵（线框轮廓），表示切分前的全貌
+  const ghostGeo = new THREE.BoxGeometry(21.5, 2.6, 1.6)
+  const ghost = new THREE.Mesh(ghostGeo, new THREE.MeshStandardMaterial({
+    color: 0x22d3ee, transparent: true, opacity: 0.09,
+    emissive: 0x22d3ee, emissiveIntensity: 0.15, depthWrite: false,
+  }))
+  ghost.position.set(0, 3.5, 0)
+  scene.add(ghost)
+  const ghostEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(ghostGeo),
+    new THREE.LineBasicMaterial({ color: 0x22d3ee, transparent: true, opacity: 0.4 })
+  )
+  ghostEdges.position.copy(ghost.position)
+  scene.add(ghostEdges)
+
+  // 4 片实体切片（切缝清晰可见），4 色各归一张卡
+  const slabTops: THREE.Vector3[] = []
+  STAGE_X.forEach((x, i) => {
+    const color = MB_COLORS[i]
+    const slab = new THREE.Mesh(
+      new THREE.BoxGeometry(4.0, 2.6, 1.6),
       new THREE.MeshStandardMaterial({
-        color: 0x1d2c44, emissive: 0x22d3ee, emissiveIntensity: 0.35,
-        transparent: true, opacity: 0.9,
+        color: 0x131f33, emissive: color, emissiveIntensity: 0.45,
+        transparent: true, opacity: 0.92,
       })
     )
-    shard.position.set(x, 2.6, 0)
-    scene.add(shard)
+    slab.position.set(x, 3.5, 0)
+    scene.add(slab)
+    slabTops.push(new THREE.Vector3(x, 4.85, 0))
   })
 
-  // 广播：token 从左侧分发到 4 张卡
+  // 输入 token：左侧一个发光白方块，广播复制给 4 张卡
+  const token = new THREE.Mesh(
+    new THREE.BoxGeometry(0.6, 0.6, 0.6),
+    new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0xffffff, emissiveIntensity: 1.1 })
+  )
+  token.position.set(-12.5, 1.0, 0)
+  scene.add(token)
+  updaters.push((_dt, t) => {
+    token.rotation.y = t * 1.5
+    token.position.y = 1.0 + Math.sin(t * 2) * 0.12
+  })
   for (const x of STAGE_X) {
     makeFlowGroup(scene, updaters,
-      [new THREE.Vector3(-13, 1.4, 0), new THREE.Vector3(x, 0.8, 0)],
-      0x22d3ee, 0.45, 2, 0.13)
+      [new THREE.Vector3(-12.1, 1.0, 0), new THREE.Vector3(x - 1.6, 0.7, 0)],
+      0xffffff, 0.5, 2, 0.12)
   }
 
-  // all-reduce 环：切片之间双向快速粒子（NVLink）
-  for (let i = 0; i < 3; i++) {
-    const a = new THREE.Vector3(STAGE_X[i], 3.6, 0)
-    const b = new THREE.Vector3(STAGE_X[i + 1], 3.6, 0)
-    makeFlow(scene, updaters, [a, b], 0x67e8f9, 0.6, 0.13, 0.05)
-    makeFlow(scene, updaters, [b, a], 0x67e8f9, 0.6, 0.13, 0.05)
-  }
-
-  // 合并输出：4 卡结果汇聚到右侧
-  for (const x of STAGE_X) {
+  // 部分积：各卡与本地切片相乘，切片颜色的部分和从 die 升进切片
+  STAGE_X.forEach((x, i) => {
     makeFlowGroup(scene, updaters,
-      [new THREE.Vector3(x, 0.8, 0), new THREE.Vector3(13, 1.4, 0)],
-      0x34d399, 0.45, 2, 0.13)
+      [new THREE.Vector3(x, 0.9, 0), new THREE.Vector3(x, 2.1, 0)],
+      MB_COLORS[i], 0.6, 2, 0.11)
+  })
+
+  // all-reduce 环：悬在切片上方的光环（NVLink），双向高速粒子对向环流
+  const ringEllipse = new THREE.EllipseCurve(0, 0, RING_RX, RING_RY, 0, Math.PI * 2)
+  const ringPts = ringEllipse.getPoints(80).map(p => new THREE.Vector3(p.x, RING_Y + p.y, 0))
+  const ringCurve = new THREE.CatmullRomCurve3(ringPts, true)
+  scene.add(new THREE.Mesh(
+    new THREE.TubeGeometry(ringCurve, 96, 0.05, 8, true),
+    new THREE.MeshStandardMaterial({ color: 0x67e8f9, transparent: true, opacity: 0.25, emissive: 0x67e8f9, emissiveIntensity: 0.5 })
+  ))
+  const ringMat = new THREE.MeshBasicMaterial({ color: 0xa5f3fc })
+  const ringGeo = new THREE.SphereGeometry(0.12, 10, 10)
+  for (let k = 0; k < 8; k++) {
+    const p = new THREE.Mesh(ringGeo, ringMat)
+    scene.add(p)
+    let t = k / 8
+    const dir = k % 2 === 0 ? 1 : -1
+    updaters.push((dt) => {
+      t = (t + dt * 0.35 * dir + 1) % 1
+      p.position.copy(ringCurve.getPointAt(t))
+    })
   }
+
+  // 4 条支线：各切片的部分和注入环
+  slabTops.forEach((top, i) => {
+    const s = Math.sqrt(Math.max(0, 1 - (STAGE_X[i] / RING_RX) ** 2))
+    const onRing = new THREE.Vector3(STAGE_X[i], RING_Y + RING_RY * s, 0)
+    makeFlowGroup(scene, updaters, [top, onRing], MB_COLORS[i], 0.5, 2, 0.1)
+  })
+
+  // 合并输出：环上 all-reduce 完成的完整结果 = 单一亮金色 token 向右离开
+  makeFlowGroup(scene, updaters,
+    [new THREE.Vector3(RING_RX, RING_Y, 0), new THREE.Vector3(13.4, 3.4, 0), new THREE.Vector3(13.4, 1.2, 0)],
+    0xffe9a8, 0.4, 2, 0.18)
+
+  // 各卡 die 按切片颜色脉动（计算活跃）
+  updaters.push((_dt, t) => {
+    boards.forEach((b, i) => {
+      b.dieMat.emissive = new THREE.Color(MB_COLORS[i])
+      b.dieMat.emissiveIntensity = 0.08 + Math.max(0, Math.sin(t * 3 + i * 1.2)) * 0.25
+    })
+  })
 }
 
 function buildPP(scene: THREE.Scene, updaters: Updater[]) {
@@ -750,7 +814,7 @@ export default function GpuLab() {
         <div className="info-card">
           <h3 className="info-title">🗺️ 并行场景图例</h3>
           <p>
-            一排 4 块 <b>GPU 板卡</b>（stage）；✂️ TP：卡上方是同一层的 <b>1/4 权重切片</b>，切片间双向粒子 = all-reduce；🏭 PP：卡上方是<b>不同的层 slab</b>，4 色微批次错位推进；📦 EP：每卡后排 2 个<b>彩色专家</b>、前排琥珀板是<b>本地 token 队列</b>；彩色 token 沿弧线发往目标专家再返回来源卡——无中央 Router，all-to-all 对称往返。
+            一排 4 块 <b>GPU 板卡</b>（stage）；✂️ TP：上方半透明矩阵是<b>切分前的完整一层 W</b>，4 色实块是被竖切的 <b>1/4 切片</b>——白 token 广播到 4 卡，切片色部分和升入切片、注入头顶的 <b>all-reduce 光环</b>，合并后亮金色 token 输出；🏭 PP：卡上方是<b>不同的层 slab</b>，4 色微批次错位推进；📦 EP：每卡后排 2 个<b>彩色专家</b>、前排琥珀板是<b>本地 token 队列</b>；彩色 token 沿弧线发往目标专家再返回来源卡——无中央 Router，all-to-all 对称往返。
           </p>
         </div>
         <div className="info-card">
