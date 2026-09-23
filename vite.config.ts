@@ -5,7 +5,7 @@ import { inspectAttr } from 'kimi-plugin-inspect-react'
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: '/learn-ai-infra/',
+  base: process.env.GITHUB_ACTIONS ? '/learn-ai-infra/' : '/',
   plugins: [inspectAttr(), react()],
   server: {
     port: 3000,

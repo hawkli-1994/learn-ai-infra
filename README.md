@@ -19,6 +19,7 @@
 - 🎬 15 步自动播放动画：客户端 → 网络 → API 网关 → Tokenizer → Prefill → decode 循环 ×N → EOS → Detokenizer → 响应返回
 - 🧩 / 🔩 标签页切换 MoE / Dense 架构（支持 `#dense` 链接直达）
 - ⏯ 播放 / 暂停 / 单步 / 重置 / 0.5–2× 变速 / 点击进度点跳转
+- 🧊 **3D GPU 实验室**（`/gpu`，Three.js）：Prefill 算力高峰、Decode 带宽瓶颈、NVLink 全互联高速路与 PCIe 星型拓扑的 3D 可交互场景（拖动旋转 / 滚轮缩放）
 - 📖 每一步的同步文字解说 + 4 张架构知识卡片
 
 ## 技术栈
