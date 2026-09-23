@@ -1,4 +1,8 @@
-# MoE vs Dense 推理流程动画
+# Learn AI Infra · MoE vs Dense 推理流程动画
+
+[![Deploy to GitHub Pages](https://github.com/hawkli-1994/learn-ai-infra/actions/workflows/deploy.yml/badge.svg)](https://github.com/hawkli-1994/learn-ai-infra/actions/workflows/deploy.yml)
+
+**在线演示**：[https://hawkli-1994.github.io/learn-ai-infra/](https://hawkli-1994.github.io/learn-ai-infra/)
 
 一个交互式动画演示：一个 prompt 从客户端通过网络进入 LLM 推理引擎，内部经历 Prefill / Decode 循环，最终变成回答返回的完整旅程。
 
