@@ -544,6 +544,15 @@ export default function Home() {
           </p>
         </div>
       </div>
+
+      {/* 署名 */}
+      <footer className="max-w-[1360px] mx-auto px-5 pb-8 text-center text-xs text-slate-500">
+        <a className="hover:text-cyan-300" href="https://www.krli.org" target="_blank" rel="noreferrer">📝 博客 krli.org</a>
+        {' · '}
+        <a className="hover:text-cyan-300" href="https://github.com/hawkli-1994" target="_blank" rel="noreferrer">🐙 GitHub @hawkli-1994</a>
+        {' · '}
+        <a className="hover:text-cyan-300" href="https://github.com/hawkli-1994/learn-ai-infra" target="_blank" rel="noreferrer">项目仓库</a>
+      </footer>
     </div>
   )
 }

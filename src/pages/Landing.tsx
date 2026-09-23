@@ -102,6 +102,10 @@ export default function Landing() {
             className="ctl-btn bg-slate-800 hover:bg-slate-700 border border-slate-700 !px-6 !py-2.5 !text-sm">
             ⭐ GitHub
           </a>
+          <a href="https://www.krli.org" target="_blank" rel="noreferrer"
+            className="ctl-btn bg-slate-800 hover:bg-slate-700 border border-slate-700 !px-6 !py-2.5 !text-sm">
+            📝 我的博客
+          </a>
         </div>
       </header>
 
@@ -139,8 +143,12 @@ export default function Landing() {
       </main>
 
       <footer className="border-t border-slate-800/60 py-8 text-center text-xs text-slate-500">
-        Learn AI Infra · 灵感来自 <a className="hover:text-cyan-300" href="https://arxiv.org/abs/2406.04692" target="_blank" rel="noreferrer">Mixture-of-Agents (arXiv:2406.04692)</a> · MIT License ·{' '}
-        <a className="hover:text-cyan-300" href="https://github.com/hawkli-1994/learn-ai-infra" target="_blank" rel="noreferrer">GitHub</a>
+        Learn AI Infra · 灵感来自 <a className="hover:text-cyan-300" href="https://arxiv.org/abs/2406.04692" target="_blank" rel="noreferrer">Mixture-of-Agents (arXiv:2406.04692)</a> · MIT License<br />
+        <a className="hover:text-cyan-300" href="https://www.krli.org" target="_blank" rel="noreferrer">📝 博客 krli.org</a>
+        {' · '}
+        <a className="hover:text-cyan-300" href="https://github.com/hawkli-1994" target="_blank" rel="noreferrer">🐙 GitHub @hawkli-1994</a>
+        {' · '}
+        <a className="hover:text-cyan-300" href="https://github.com/hawkli-1994/learn-ai-infra" target="_blank" rel="noreferrer">项目仓库</a>
       </footer>
     </div>
   )
