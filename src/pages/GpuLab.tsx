@@ -8,7 +8,7 @@ import '../App.css'
 /* 模式定义                                                            */
 /* ------------------------------------------------------------------ */
 
-type Mode = 'prefill' | 'decode' | 'nvlink' | 'pcie'
+type Mode = 'prefill' | 'decode' | 'nvlink' | 'pcie' | 'tp' | 'pp' | 'ep'
 
 const MODES: { id: Mode; label: string; icon: string }[] = [
   { id: 'prefill', label: 'Prefill 的 GPU', icon: '⚡' },
@@ -16,6 +16,16 @@ const MODES: { id: Mode; label: string; icon: string }[] = [
   { id: 'nvlink', label: 'NVLink 多卡互联', icon: '🔗' },
   { id: 'pcie', label: 'PCIe 多卡互联', icon: '🚌' },
 ]
+
+const PARALLEL_MODES: { id: Mode; label: string; icon: string }[] = [
+  { id: 'tp', label: '张量并行 TP', icon: '✂️' },
+  { id: 'pp', label: '流水线并行 PP', icon: '🏭' },
+  { id: 'ep', label: '专家并行 EP', icon: '📦' },
+]
+
+const EXPERT_COLORS = [0x22d3ee, 0x34d399, 0xfbbf24, 0xf472b6, 0xa78bfa, 0xfb923c, 0x4ade80, 0x38bdf8]
+const MB_COLORS = [0x22d3ee, 0x34d399, 0xfbbf24, 0xf472b6]
+const STAGE_X = [-7.5, -2.5, 2.5, 7.5]
 
 const HUD: Record<Mode, { title: string; chips: string[]; desc: string }> = {
   prefill: {
@@ -37,6 +47,21 @@ const HUD: Record<Mode, { title: string; chips: string[]; desc: string }> = {
     title: 'PCIe 多卡互联：乡间小路',
     chips: ['PCIe 5.0 x16 ≈ 64 GB/s', '拓扑：星型，经 PCIe Switch/CPU', '与 CPU 内存/外设共享', '带宽约为 NVLink 的 1/14'],
     desc: '没有 NVLink 时，卡间通信只能走 PCIe 交换机（甚至要经 CPU 内存中转），带宽低一个数量级、延迟更高。消费级显卡组多卡训练/推理时，通信开销会显著吃掉算力红利——这也是跨节点专家并行、DeepSeek 的跨节点 DMA 等优化存在的原因。',
+  },
+  tp: {
+    title: '张量并行 TP：把一层切开（Megatron-LM）',
+    chips: ['切分：层内权重（列/行切）', '每 token 广播 → 各算一片 → all-reduce 合并', '通信量：大 · 延迟敏感', '适用范围：单机 NVLink 域内（通常 ≤8 卡）'],
+    desc: '同一个层的权重矩阵被切成 4 片放在 4 张卡上；每个 token 先广播到全部 GPU，各自计算部分结果，再沿 NVLink 环做 all-reduce 合并。每层两次集合通信，带宽需求极高——TP 几乎是 NVLink 存在的理由。',
+  },
+  pp: {
+    title: '流水线并行 PP：把模型分层（GPipe / 1F1B）',
+    chips: ['切分：按层分段（stage）', '只传相邻 stage 之间的激活', '通信量：小 · 可跨机扩展', '代价：流水线气泡（bubble）'],
+    desc: 'GPU0 算前几层、GPU1 算中间几层……像流水线工厂：4 个颜色的微批次（micro-batch）错位推进，同一时刻不同 GPU 在算不同的批次。气泡 = 流水线填充/排空时的空转时间，GPipe、1F1B、PipeDream 的各种调度都是在压缩气泡。',
+  },
+  ep: {
+    title: '专家并行 EP：把专家搬到不同卡（GShard / DeepSeek）',
+    chips: ['切分：MoE 的 Expert 分散放置', 'Router 决定 token 去向', '通信：all-to-all dispatch / combine', '代表：GShard、Mixtral、DeepSeek-V3'],
+    desc: '每个 GPU 只放 2 个专家；token 经过门控网络后，被「快递」到目标专家所在的卡（dispatch），算完再汇回（combine）——这就是 all-to-all。专家越多扩展性越好；通信密集但可用更便宜的互联（甚至跨节点），所以 DeepSeek 用 EP 替换大部分 TP。',
   },
 }
 
@@ -128,7 +153,8 @@ function makeFlow(
 /** 拖尾粒子组（同一路径多个粒子） */
 function makeFlowGroup(
   scene: THREE.Scene, updaters: Updater[],
-  points: THREE.Vector3[], color: number, speed: number, count: number, size = 0.13
+  points: THREE.Vector3[], color: number, speed: number, count: number, size = 0.13,
+  startOffset = 0
 ) {
   const curve = new THREE.CatmullRomCurve3(points)
   const mat = new THREE.MeshBasicMaterial({ color })
@@ -136,7 +162,7 @@ function makeFlowGroup(
   for (let i = 0; i < count; i++) {
     const p = new THREE.Mesh(geo, mat)
     scene.add(p)
-    let t = i / count
+    let t = (startOffset + i / count) % 1
     updaters.push((dt) => {
       t += dt * speed
       if (t > 1) t -= 1
@@ -353,11 +379,159 @@ function buildPcie(scene: THREE.Scene, updaters: Updater[]) {
   })
 }
 
+/* ---------- 并行策略场景：TP / PP / EP ---------- */
+
+/** 通用：一排 4 张 GPU，返回板卡对象 */
+function makeStageRow(scene: THREE.Scene, accent = 0x22d3ee) {
+  const boards = STAGE_X.map((x) => {
+    const b = makeBoard({ accent })
+    b.group.position.set(x, 0.6, 0)
+    scene.add(b.group)
+    return b
+  })
+  return boards
+}
+
+function buildTP(scene: THREE.Scene, updaters: Updater[]) {
+  makeGrid(scene)
+  makeStageRow(scene)
+
+  // 每卡上方的「权重切片」（1/4 矩阵），切开的缝清晰可见
+  STAGE_X.forEach((x) => {
+    const shard = new THREE.Mesh(
+      new THREE.BoxGeometry(1.5, 1.3, 1.5),
+      new THREE.MeshStandardMaterial({
+        color: 0x1d2c44, emissive: 0x22d3ee, emissiveIntensity: 0.35,
+        transparent: true, opacity: 0.9,
+      })
+    )
+    shard.position.set(x, 2.6, 0)
+    scene.add(shard)
+  })
+
+  // 广播：token 从左侧分发到 4 张卡
+  for (const x of STAGE_X) {
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-13, 1.4, 0), new THREE.Vector3(x, 0.8, 0)],
+      0x22d3ee, 0.45, 2, 0.13)
+  }
+
+  // all-reduce 环：切片之间双向快速粒子（NVLink）
+  for (let i = 0; i < 3; i++) {
+    const a = new THREE.Vector3(STAGE_X[i], 3.6, 0)
+    const b = new THREE.Vector3(STAGE_X[i + 1], 3.6, 0)
+    makeFlow(scene, updaters, [a, b], 0x67e8f9, 0.6, 0.13, 0.05)
+    makeFlow(scene, updaters, [b, a], 0x67e8f9, 0.6, 0.13, 0.05)
+  }
+
+  // 合并输出：4 卡结果汇聚到右侧
+  for (const x of STAGE_X) {
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(x, 0.8, 0), new THREE.Vector3(13, 1.4, 0)],
+      0x34d399, 0.45, 2, 0.13)
+  }
+}
+
+function buildPP(scene: THREE.Scene, updaters: Updater[]) {
+  makeGrid(scene)
+  makeStageRow(scene, 0x34d399)
+
+  // 每卡上方一叠「层」slab，表示各 stage 负责不同的层
+  STAGE_X.forEach((x) => {
+    for (let i = 0; i < 4; i++) {
+      const slab = new THREE.Mesh(
+        new THREE.BoxGeometry(3.2, 0.16, 2.4),
+        new THREE.MeshStandardMaterial({
+          color: 0x16283a, emissive: 0x34d399, emissiveIntensity: 0.12 + i * 0.08,
+        })
+      )
+      slab.position.set(x, 0.85 + i * 0.26, 0)
+      scene.add(slab)
+    }
+  })
+
+  // 4 个微批次错位推进（相位错开 = 流水线）
+  for (let mb = 0; mb < 4; mb++) {
+    const z = -1.5 + mb
+    const pts = [
+      new THREE.Vector3(-13, 1.4, z),
+      ...STAGE_X.map((x) => new THREE.Vector3(x, 1.4, z)),
+      new THREE.Vector3(13, 1.4, z),
+    ]
+    makeFlowGroup(scene, updaters, pts, MB_COLORS[mb], 0.14, 2, 0.15, mb * 0.25)
+  }
+
+  // stage 间激活传递的连线
+  for (let i = 0; i < 3; i++) {
+    const a = new THREE.Vector3(STAGE_X[i] + 3, 1.4, 0)
+    const b = new THREE.Vector3(STAGE_X[i + 1] - 3, 1.4, 0)
+    makeFlow(scene, updaters, [a, b], 0x34d399, 0.14, 0.13, 0.035)
+  }
+}
+
+function buildEP(scene: THREE.Scene, updaters: Updater[]) {
+  makeGrid(scene)
+  const boards = makeStageRow(scene, 0xf59e0b)
+
+  // 每卡 2 个专家，颜色各异
+  const expertPos: THREE.Vector3[] = []
+  STAGE_X.forEach((x, gi) => {
+    for (let e = 0; e < 2; e++) {
+      const idx = gi * 2 + e
+      const color = EXPERT_COLORS[idx]
+      const chip = new THREE.Mesh(
+        new THREE.BoxGeometry(1.5, 0.6, 1.5),
+        new THREE.MeshStandardMaterial({ color: 0x1c2436, emissive: color, emissiveIntensity: 0.55 })
+      )
+      const pos = new THREE.Vector3(x - 0.9 + e * 1.8, 1.3, 0)
+      chip.position.copy(pos)
+      scene.add(chip)
+      expertPos.push(pos.clone().setY(1.3))
+      // 让所属 GPU 的 die 也带上专家色微光
+      boards[gi].dieMat.emissive = new THREE.Color(color)
+      boards[gi].dieMat.emissiveIntensity = 0.12
+    }
+  })
+
+  // Router：左侧门控节点
+  const router = new THREE.Mesh(
+    new THREE.BoxGeometry(1.6, 1.6, 1.6),
+    new THREE.MeshStandardMaterial({ color: 0x2c2314, emissive: 0xfbbf24, emissiveIntensity: 0.7 })
+  )
+  router.position.set(-13, 1.4, 0)
+  scene.add(router)
+  const output = new THREE.Mesh(
+    new THREE.BoxGeometry(1.4, 1.4, 1.4),
+    new THREE.MeshStandardMaterial({ color: 0x14301f, emissive: 0x34d399, emissiveIntensity: 0.6 })
+  )
+  output.position.set(13, 1.4, 0)
+  scene.add(output)
+
+  // all-to-all dispatch：每个专家一条彩色线，token 定向快递
+  expertPos.forEach((pos, idx) => {
+    const color = EXPERT_COLORS[idx]
+    makeFlowGroup(scene, updaters,
+      [new THREE.Vector3(-12, 1.4, 0), pos.clone().setY(1.3)],
+      color, 0.32, 2, 0.11)
+    // combine：专家结果汇回输出节点
+    makeFlowGroup(scene, updaters,
+      [pos.clone().setY(1.3), new THREE.Vector3(12, 1.4, 0)],
+      color, 0.32, 2, 0.11)
+  })
+
+  updaters.push((_dt, t) => {
+    ;(router.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.5 + Math.sin(t * 3) * 0.3
+  })
+}
+
 const BUILDERS: Record<Mode, (scene: THREE.Scene, updaters: Updater[]) => void> = {
   prefill: buildPrefill,
   decode: buildDecode,
   nvlink: buildNvlink,
   pcie: buildPcie,
+  tp: buildTP,
+  pp: buildPP,
+  ep: buildEP,
 }
 
 const CAM_POS: Record<Mode, [number, number, number]> = {
@@ -365,6 +539,9 @@ const CAM_POS: Record<Mode, [number, number, number]> = {
   decode: [11, 9, 13],
   nvlink: [0, 17, 22],
   pcie: [0, 19, 21],
+  tp: [0, 8, 21],
+  pp: [0, 9, 23],
+  ep: [0, 9, 22],
 }
 
 /* ------------------------------------------------------------------ */
@@ -444,9 +621,10 @@ function GpuScene({ mode }: { mode: Mode }) {
 export default function GpuLab() {
   const [mode, setMode] = useState<Mode>(() => {
     const h = typeof window !== 'undefined' ? window.location.hash.replace('#', '') : ''
-    return (MODES.some((m) => m.id === h) ? h : 'prefill') as Mode
+    return ([...MODES, ...PARALLEL_MODES].some((m) => m.id === h) ? h : 'prefill') as Mode
   })
   const hud = HUD[mode]
+  const isParallel = (PARALLEL_MODES as { id: Mode }[]).some((m) => m.id === mode)
   const selectMode = (m: Mode) => {
     setMode(m)
     window.location.hash = m
@@ -470,13 +648,25 @@ export default function GpuLab() {
       </header>
 
       {/* 场景切换 */}
-      <div className="max-w-[1360px] mx-auto px-5 flex flex-wrap gap-2 pb-4">
-        {MODES.map((m) => (
-          <button key={m.id} onClick={() => selectMode(m.id)}
-            className={`arch-tab ${mode === m.id ? 'arch-tab-on-moe' : 'arch-tab-off'}`}>
-            {m.icon} {m.label}
-          </button>
-        ))}
+      <div className="max-w-[1360px] mx-auto px-5 pb-4">
+        <div className="flex flex-wrap items-center gap-x-1 gap-y-2">
+          <span className="text-[11px] text-slate-500 mr-1">引擎内部</span>
+          {MODES.map((m) => (
+            <button key={m.id} onClick={() => selectMode(m.id)}
+              className={`arch-tab ${mode === m.id ? 'arch-tab-on-moe' : 'arch-tab-off'}`}>
+              {m.icon} {m.label}
+            </button>
+          ))}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-1 gap-y-2 mt-2">
+          <span className="text-[11px] text-slate-500 mr-1">并行策略</span>
+          {PARALLEL_MODES.map((m) => (
+            <button key={m.id} onClick={() => selectMode(m.id)}
+              className={`arch-tab ${mode === m.id ? 'arch-tab-on-moe' : 'arch-tab-off'}`}>
+              {m.icon} {m.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* 3D 画布 + HUD */}
@@ -505,6 +695,7 @@ export default function GpuLab() {
 
       {/* 图例 / 说明 */}
       <div className="max-w-[1360px] mx-auto px-5 mt-6 pb-14 grid md:grid-cols-2 gap-4">
+        {!isParallel && (<>
         <div className="info-card">
           <h3 className="info-title">🗺️ 场景图例</h3>
           <p>
@@ -534,6 +725,35 @@ export default function GpuLab() {
             ① 减少跨卡通信：数据并行代替张量并行；② 通信与计算重叠（overlap）；③ DeepSeek 的跨节点 DMA / 专家并行把通信摊到训练全程；④ 消费级组集群时优先同机 NVLink 域内做张量并行，跨机走 RDMA 网络。
           </p>
         </div>
+        </>)}
+        {isParallel && (<>
+        <div className="info-card">
+          <h3 className="info-title">🗺️ 并行场景图例</h3>
+          <p>
+            一排 4 块 <b>GPU 板卡</b>（stage）；✂️ TP：卡上方是同一层的 <b>1/4 权重切片</b>，切片间双向粒子 = all-reduce；🏭 PP：卡上方是<b>不同的层 slab</b>，4 色微批次错位推进；📦 EP：卡上方是 8 个<b>彩色专家</b>，彩色 token 经 Router 定向快递（all-to-all）。
+          </p>
+        </div>
+        <div className="info-card">
+          <h3 className="info-title">⚖️ 三种并行速查</h3>
+          <p>
+            <b>TP 张量并行</b>：切层内权重 · 通信大、延迟敏感 · 只活在 NVLink 域（≤8 卡）<br />
+            <b>PP 流水线并行</b>：切层 · 通信小、可跨机上百卡 · 有气泡<br />
+            <b>EP 专家并行</b>：切 MoE 专家 · all-to-all、随专家数扩展 · 可跨节点
+          </p>
+        </div>
+        <div className="info-card">
+          <h3 className="info-title">🫧 流水线气泡是怎么回事？</h3>
+          <p>
+            朴素 GPipe 中，第一个微批次要等它流过全部 stage，后面的才能开始——填充与排空阶段的空转就是气泡，约占 <b>(P-1)/M</b>（P=stage 数，M=微批数）。<b>1F1B</b>（一次前向一次反向）让稳态时各 stage 错开算微批，大幅减少显存与气泡；交错式（interleaved）1F1B 进一步压缩。
+          </p>
+        </div>
+        <div className="info-card">
+          <h3 className="info-title">🚀 实战组合：DeepSeek-V3 与 3D 并行</h3>
+          <p>
+            现代大模型训练用 <b>DP × TP × PP × EP</b> 混合：数据并行切 batch，TP 在单机 NVLink 域内切少量敏感层，PP 跨机切层，EP 把 MoE 专家撒到大量卡上。DeepSeek-V3 的关键取舍就是<b>用 EP 替代大部分 TP</b>：all-to-all 对带宽要求低于 all-reduce，跨节点也能跑，再把通信和计算重叠——384 张卡一个 EP 组，把专家并行的扩展性榨干。
+          </p>
+        </div>
+        </>)}
       </div>
     </div>
   )
